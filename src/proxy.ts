@@ -130,6 +130,7 @@ interface ActiveBridge {
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
   pendingExecs: PendingExec[];
+  usage: UsageState;
   /** Resolve function to resume streaming after tool results are sent. */
   onResume: ((sendFrame: (data: Uint8Array) => void) => void) | null;
 }
@@ -243,7 +244,7 @@ export async function startProxy(
   if (proxyServer && proxyPort) return proxyPort;
 
   proxyServer = Bun.serve({
-    port: 0,
+    port: Number(process.env.CURSOR_PROXY_PORT || 0),
     idleTimeout: 255, // max — Cursor responses can take 30s+
     async fetch(req) {
       const url = new URL(req.url);
@@ -334,7 +335,24 @@ function handleChatCompletion(
   }
 
   const mcpTools = buildMcpToolDefinitions(tools);
-  const payload = buildCursorRequest(modelId, systemPrompt, userText, turns);
+  // Cursor rejects the hand-built protobuf turn history with an internal
+  // Connect error. Preserve the OpenAI roles by putting prior turns into the
+  // current prompt instead of pretending they are native Cursor turns.
+  const hasCustomSystem = systemPrompt && systemPrompt !== "You are a helpful assistant.";
+  const historyText = turns
+    .map((turn) => `USER:\n${turn.userText}\n\nASSISTANT:\n${turn.assistantText}`)
+    .join("\n\n");
+  const inlinedUserText = hasCustomSystem || historyText
+    ? [
+        ...(hasCustomSystem ? [`SYSTEM:\n${systemPrompt}`] : []),
+        ...(historyText ? [`CONVERSATION HISTORY:\n${historyText}`] : []),
+        `CURRENT USER:\n${userText}`,
+        ...(hasCustomSystem
+          ? ["Follow the SYSTEM instructions exactly. Return only the requested final answer with no extra commentary."]
+          : []),
+      ].join("\n\n")
+    : userText;
+  const payload = buildCursorRequest(modelId, systemPrompt, inlinedUserText, []);
   payload.mcpTools = mcpTools;
 
   if (body.stream === false) {
@@ -575,6 +593,67 @@ interface StreamState {
   thinkingActive: boolean;
   toolCallIndex: number;
   pendingExecs: PendingExec[];
+  usage: UsageState;
+}
+
+interface UsageState {
+  completionTokens: number;
+  totalTokens: number;
+  maxTokens: number;
+}
+
+function createUsageState(): UsageState {
+  return { completionTokens: 0, totalTokens: 0, maxTokens: 0 };
+}
+
+function openAiUsage(usage: UsageState) {
+  const completionTokens = Math.max(0, usage.completionTokens);
+  const totalTokens = Math.max(completionTokens, usage.totalTokens);
+  return {
+    prompt_tokens: Math.max(0, totalTokens - completionTokens),
+    completion_tokens: completionTokens,
+    total_tokens: totalTokens,
+  };
+}
+
+function createPacedTextEmitter(emit: (text: string) => void) {
+  const intervalMs = 24;
+  const charsPerTick = 8;
+  let pending = "";
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let flushResolvers: Array<() => void> = [];
+
+  const resolveFlushes = () => {
+    if (pending || timer) return;
+    const resolvers = flushResolvers;
+    flushResolvers = [];
+    for (const resolve of resolvers) resolve();
+  };
+  const pump = () => {
+    timer = null;
+    if (!pending) {
+      resolveFlushes();
+      return;
+    }
+    const chars = Array.from(pending);
+    const chunk = chars.slice(0, charsPerTick).join("");
+    pending = chars.slice(charsPerTick).join("");
+    emit(chunk);
+    if (pending) timer = setTimeout(pump, intervalMs);
+    else resolveFlushes();
+  };
+
+  return {
+    enqueue(text: string) {
+      if (!text) return;
+      pending += text;
+      if (!timer) timer = setTimeout(pump, 0);
+    },
+    flush() {
+      if (!pending && !timer) return Promise.resolve();
+      return new Promise<void>((resolve) => flushResolvers.push(resolve));
+    },
+  };
 }
 
 function processServerMessage(
@@ -589,7 +668,11 @@ function processServerMessage(
   const msgCase = msg.message.case;
 
   if (msgCase === "interactionUpdate") {
-    handleInteractionUpdate(msg.message.value, onText);
+    handleInteractionUpdate(msg.message.value, state, onText);
+  } else if (msgCase === "conversationCheckpointUpdate") {
+    const details = msg.message.value.tokenDetails;
+    if (details?.usedTokens) state.usage.totalTokens = details.usedTokens;
+    if (details?.maxTokens) state.usage.maxTokens = details.maxTokens;
   } else if (msgCase === "kvServerMessage") {
     handleKvMessage(msg.message.value as KvServerMessage, blobStore, sendFrame);
   } else if (msgCase === "execServerMessage") {
@@ -609,6 +692,7 @@ function processServerMessage(
  */
 function handleInteractionUpdate(
   update: any,
+  state: StreamState,
   onText: (text: string, isThinking?: boolean) => void,
 ): void {
   const updateCase = update.message?.case;
@@ -619,6 +703,8 @@ function handleInteractionUpdate(
   } else if (updateCase === "thinkingDelta") {
     const delta = update.message.value.text || "";
     if (delta) onText(delta, true);
+  } else if (updateCase === "tokenDelta") {
+    state.usage.completionTokens += Math.max(0, Number(update.message.value.tokens) || 0);
   }
   // toolCallStarted, partialToolCall, toolCallDelta, toolCallCompleted
   // are intentionally ignored. MCP tool calls flow through the exec
@@ -891,18 +977,24 @@ function handleStreamingResponse(
       const makeChunk = (
         delta: Record<string, unknown>,
         finishReason: string | null = null,
+        usage?: ReturnType<typeof openAiUsage>,
       ) => ({
         id: completionId,
         object: "chat.completion.chunk",
         created,
         model: modelId,
         choices: [{ index: 0, delta, finish_reason: finishReason }],
+        ...(usage ? { usage } : {}),
+      });
+      const pacedText = createPacedTextEmitter((text) => {
+        sendSSE(makeChunk({ content: text }));
       });
 
       const state: StreamState = {
         thinkingActive: false,
         toolCallIndex: 0,
         pendingExecs: [],
+        usage: createUsageState(),
       };
 
       let mcpExecReceived = false;
@@ -930,7 +1022,7 @@ function handleStreamingResponse(
           if (flags & CONNECT_END_STREAM_FLAG) {
             const endError = parseConnectEndStream(messageBytes);
             if (endError) {
-              sendSSE(makeChunk({ content: `\n[Error: ${endError.message}]` }));
+              pacedText.enqueue(`\n[Error: ${endError.message}]`);
             }
             continue;
           }
@@ -948,44 +1040,12 @@ function handleStreamingResponse(
               state,
               // onText
               (text, isThinking) => {
-                if (isThinking) {
-                  if (!state.thinkingActive) {
-                    state.thinkingActive = true;
-                    sendSSE(makeChunk({ role: "assistant", content: "<think>" }));
-                  }
-                  sendSSE(makeChunk({ content: text }));
-                } else {
-                  if (state.thinkingActive) {
-                    state.thinkingActive = false;
-                    sendSSE(makeChunk({ content: "</think>" }));
-                  }
-                  sendSSE(makeChunk({ content: text }));
-                }
+                if (!isThinking) pacedText.enqueue(text);
               },
               // onMcpExec — the model wants to execute a tool.
               (exec) => {
                 state.pendingExecs.push(exec);
                 mcpExecReceived = true;
-
-                // Close thinking if active
-                if (state.thinkingActive) {
-                  sendSSE(makeChunk({ content: "</think>" }));
-                  state.thinkingActive = false;
-                }
-
-                // Emit tool_calls with decoded arguments
-                const toolCallIndex = state.toolCallIndex++;
-                sendSSE(makeChunk({
-                  tool_calls: [{
-                    index: toolCallIndex,
-                    id: exec.toolCallId,
-                    type: "function",
-                    function: {
-                      name: exec.toolName,
-                      arguments: exec.decodedArgs,
-                    },
-                  }],
-                }));
 
                 // Keep the bridge alive for tool result continuation.
                 activeBridges.set(bridgeKey, {
@@ -994,12 +1054,26 @@ function handleStreamingResponse(
                   blobStore: payload.blobStore,
                   mcpTools: payload.mcpTools,
                   pendingExecs: state.pendingExecs,
+                  usage: state.usage,
                   onResume: null,
                 });
-
-                sendSSE(makeChunk({}, "tool_calls"));
-                sendDone();
-                closeController();
+                void pacedText.flush().then(() => {
+                  const toolCallIndex = state.toolCallIndex++;
+                  sendSSE(makeChunk({
+                    tool_calls: [{
+                      index: toolCallIndex,
+                      id: exec.toolCallId,
+                      type: "function",
+                      function: {
+                        name: exec.toolName,
+                        arguments: exec.decodedArgs,
+                      },
+                    }],
+                  }));
+                  sendSSE(makeChunk({}, "tool_calls"));
+                  sendDone();
+                  closeController();
+                });
               },
             );
           } catch {
@@ -1010,14 +1084,12 @@ function handleStreamingResponse(
 
       bridge.onData(processChunk);
 
-      bridge.onClose(() => {
+      bridge.onClose(async () => {
         clearInterval(heartbeatTimer);
         if (!mcpExecReceived) {
           // Normal completion — no pending tool calls
-          if (state.thinkingActive) {
-            sendSSE(makeChunk({ content: "</think>" }));
-          }
-          sendSSE(makeChunk({}, "stop"));
+          await pacedText.flush();
+          sendSSE(makeChunk({}, "stop", openAiUsage(state.usage)));
           sendDone();
           closeController();
         }
@@ -1046,7 +1118,7 @@ function handleToolResultResume(
   accessToken: string,
   bridgeKey: string,
 ): Response {
-  const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs } = active;
+  const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs, usage } = active;
 
   // Send mcpResult for each pending exec that has a matching tool result
   for (const exec of pendingExecs) {
@@ -1120,18 +1192,24 @@ function handleToolResultResume(
       const makeChunk = (
         delta: Record<string, unknown>,
         finishReason: string | null = null,
+        finalUsage?: ReturnType<typeof openAiUsage>,
       ) => ({
         id: completionId,
         object: "chat.completion.chunk",
         created,
         model: modelId,
         choices: [{ index: 0, delta, finish_reason: finishReason }],
+        ...(finalUsage ? { usage: finalUsage } : {}),
+      });
+      const pacedText = createPacedTextEmitter((text) => {
+        sendSSE(makeChunk({ content: text }));
       });
 
       const state: StreamState = {
         thinkingActive: false,
         toolCallIndex: 0,
         pendingExecs: [],
+        usage,
       };
 
       let mcpExecReceived = false;
@@ -1152,7 +1230,7 @@ function handleToolResultResume(
           if (flags & CONNECT_END_STREAM_FLAG) {
             const endError = parseConnectEndStream(messageBytes);
             if (endError) {
-              sendSSE(makeChunk({ content: `\n[Error: ${endError.message}]` }));
+              pacedText.enqueue(`\n[Error: ${endError.message}]`);
             }
             continue;
           }
@@ -1169,41 +1247,11 @@ function handleToolResultResume(
               (data) => bridge.write(data),
               state,
               (text, isThinking) => {
-                if (isThinking) {
-                  if (!state.thinkingActive) {
-                    state.thinkingActive = true;
-                    sendSSE(makeChunk({ role: "assistant", content: "<think>" }));
-                  }
-                  sendSSE(makeChunk({ content: text }));
-                } else {
-                  if (state.thinkingActive) {
-                    state.thinkingActive = false;
-                    sendSSE(makeChunk({ content: "</think>" }));
-                  }
-                  sendSSE(makeChunk({ content: text }));
-                }
+                if (!isThinking) pacedText.enqueue(text);
               },
               (exec) => {
                 state.pendingExecs.push(exec);
                 mcpExecReceived = true;
-
-                if (state.thinkingActive) {
-                  sendSSE(makeChunk({ content: "</think>" }));
-                  state.thinkingActive = false;
-                }
-
-                const toolCallIndex = state.toolCallIndex++;
-                sendSSE(makeChunk({
-                  tool_calls: [{
-                    index: toolCallIndex,
-                    id: exec.toolCallId,
-                    type: "function",
-                    function: {
-                      name: exec.toolName,
-                      arguments: exec.decodedArgs,
-                    },
-                  }],
-                }));
 
                 activeBridges.set(bridgeKey, {
                   bridge,
@@ -1211,12 +1259,26 @@ function handleToolResultResume(
                   blobStore,
                   mcpTools,
                   pendingExecs: state.pendingExecs,
+                  usage: state.usage,
                   onResume: null,
                 });
-
-                sendSSE(makeChunk({}, "tool_calls"));
-                sendDone();
-                closeController();
+                void pacedText.flush().then(() => {
+                  const toolCallIndex = state.toolCallIndex++;
+                  sendSSE(makeChunk({
+                    tool_calls: [{
+                      index: toolCallIndex,
+                      id: exec.toolCallId,
+                      type: "function",
+                      function: {
+                        name: exec.toolName,
+                        arguments: exec.decodedArgs,
+                      },
+                    }],
+                  }));
+                  sendSSE(makeChunk({}, "tool_calls"));
+                  sendDone();
+                  closeController();
+                });
               },
             );
           } catch {
@@ -1228,13 +1290,11 @@ function handleToolResultResume(
       // Re-attach data handler to the existing bridge
       bridge.onData(processChunk);
 
-      bridge.onClose(() => {
+      bridge.onClose(async () => {
         clearInterval(heartbeatTimer);
         if (!mcpExecReceived) {
-          if (state.thinkingActive) {
-            sendSSE(makeChunk({ content: "</think>" }));
-          }
-          sendSSE(makeChunk({}, "stop"));
+          await pacedText.flush();
+          sendSSE(makeChunk({}, "stop", openAiUsage(state.usage)));
           sendDone();
           closeController();
         }
@@ -1262,7 +1322,7 @@ function handleNonStreamingResponse(
   const created = Math.floor(Date.now() / 1000);
 
   const responsePromise = collectFullResponse(payload, accessToken).then(
-    (fullText) =>
+    ({ content, usage }) =>
       new Response(
         JSON.stringify({
           id: completionId,
@@ -1272,15 +1332,11 @@ function handleNonStreamingResponse(
           choices: [
             {
               index: 0,
-              message: { role: "assistant", content: fullText },
+              message: { role: "assistant", content },
               finish_reason: "stop",
             },
           ],
-          usage: {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
-          },
+          usage,
         }),
         { headers: { "Content-Type": "application/json" } },
       ),
@@ -1292,8 +1348,8 @@ function handleNonStreamingResponse(
 async function collectFullResponse(
   payload: CursorRequestPayload,
   accessToken: string,
-): Promise<string> {
-  const { promise, resolve } = Promise.withResolvers<string>();
+): Promise<{ content: string; usage: ReturnType<typeof openAiUsage> }> {
+  const { promise, resolve } = Promise.withResolvers<{ content: string; usage: ReturnType<typeof openAiUsage> }>();
   let fullText = "";
 
   const bridge = spawnBridge(accessToken);
@@ -1309,6 +1365,7 @@ async function collectFullResponse(
     thinkingActive: false,
     toolCallIndex: 0,
     pendingExecs: [],
+    usage: createUsageState(),
   };
 
   bridge.onData((incoming) => {
@@ -1335,7 +1392,7 @@ async function collectFullResponse(
           payload.mcpTools,
           (data) => bridge.write(data),
           state,
-          (text) => { fullText += text; },
+          (text, isThinking) => { if (!isThinking) fullText += text; },
           () => {},
         );
       } catch {
@@ -1346,7 +1403,7 @@ async function collectFullResponse(
 
   bridge.onClose(() => {
     clearInterval(heartbeatTimer);
-    resolve(fullText);
+    resolve({ content: fullText, usage: openAiUsage(state.usage) });
   });
 
   return promise;
