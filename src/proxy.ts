@@ -244,6 +244,7 @@ export async function startProxy(
   if (proxyServer && proxyPort) return proxyPort;
 
   proxyServer = Bun.serve({
+    hostname: process.env.CURSOR_PROXY_HOST || "127.0.0.1",
     port: Number(process.env.CURSOR_PROXY_PORT || 0),
     idleTimeout: 255, // max — Cursor responses can take 30s+
     async fetch(req) {
